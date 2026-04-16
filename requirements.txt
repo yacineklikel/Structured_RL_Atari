@@ -24,3 +24,4 @@ psutil
 opencv-python>=4.8.0
 
 moviepy>=1.0.3
+

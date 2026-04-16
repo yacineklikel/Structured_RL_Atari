@@ -4,7 +4,7 @@ version = "260416"
 # HYPERPARAMETRES
 #########################################################
 taille_buffer = int(1e5)
-n_steps = int(1e5)
+n_steps = int(1e3)
 n_envs = 32
 batch_size = 256
 
@@ -65,6 +65,7 @@ from gymnasium.wrappers import AtariPreprocessing
 from gymnasium.wrappers import FrameStackObservation
 import ale_py
 gym.register_envs(ale_py)
+import glob
 
 
 # =========================================================================
@@ -263,9 +264,11 @@ def evaluate_and_record(actor, device, step_num, video_folder=f"./videos_{versio
     eval_env = gym.make("ALE/Enduro-v5", render_mode="rgb_array", frameskip=1)
     eval_env = AtariPreprocessing(eval_env, screen_size=84, grayscale_obs=True, frame_skip=n_skip)
     eval_env = FrameStackObservation(eval_env, stack_size=n_skip)
+    
     eval_env = RecordVideo(eval_env, video_folder, episode_trigger=lambda x: True, name_prefix=f"step_{step_num}")
     obs, _ = eval_env.reset()
     done = False
+    
     while not done:
         obs_array = np.array(obs.__array__()) 
         obs_tensor = torch.tensor(obs_array, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
@@ -274,15 +277,35 @@ def evaluate_and_record(actor, device, step_num, video_folder=f"./videos_{versio
             path_scores = theta[:, path_map].sum(dim=-1)
             best_path_ids = torch.argmax(path_scores, dim=1)
             action_nn = path_map[best_path_ids, 0].item()
-            action_env = ACTION_MAP[action_nn] #traduction des 4 dim du reseau en les 4 actions permieses parmis les 9
+            action_env = ACTION_MAP[action_nn] 
         obs, _ , terminated, truncated, _ = eval_env.step(action_env)
         done = terminated or truncated
+        
     eval_env.close()
+
+    # =========================================================================
+    # LE NETTOYAGE : cette partie sert a rien juste a renommer les ficheirs pour
+    # faire un joli dossier
+    # =========================================================================
+    for fichier in glob.glob(os.path.join(video_folder, f"step_{step_num}*episode*")):
+        # Si c'est la vidéo, on la renomme proprement
+        if fichier.endswith(".mp4"):
+            nom_propre = os.path.join(video_folder, f"step_{step_num}.mp4")
+            # Sécurité : si la vidéo propre existe déjà, on l'écrase
+            if os.path.exists(nom_propre):
+                os.remove(nom_propre)
+            os.rename(fichier, nom_propre)
+        # Si c'est le fichier meta, on le jette à la poubelle
+        elif fichier.endswith(".meta.json"):
+            os.remove(fichier)
+    # =========================================================================
+
+
 
 if __name__ == '__main__':
     os.makedirs(f"./poids_{version}", exist_ok=True)
     os.makedirs(f"./videos_{version}", exist_ok=True)
-    os.makedirs(f"./plots_{version}", exist_ok=True)
+    os.makedirs(f"./logs_{version}", exist_ok=True)
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Utilisation de l'appareil : {device}")
@@ -410,11 +433,11 @@ if __name__ == '__main__':
 
     envs.close()
     print("\nEntraînement terminé ! Sauvegarde du cerveau de l'IA en cours...")
-    torch.save(actor.state_dict(), f"./poids_{version}/actor_{step + 1}.pth")
-    torch.save(critic.state_dict(), f"./poids_{version}/critic_{step + 1}.pth")
-    np.save(f"./poids_{version}/history_loss_c.npy", history_loss_c)
-    np.save(f"./poids_{version}/history_loss_a.npy", history_loss_a)
-    np.save(f"./poids_{version}/history_entropy.npy", history_entropy)
-    np.save(f"./poids_{version}/history_confidence.npy", history_confidence)
-    evaluate_and_record(actor, device, "final")
+    torch.save(actor.state_dict(), f"./poids_{version}/actor_{n_steps}.pth")
+    torch.save(critic.state_dict(), f"./poids_{version}/critic_{n_steps}.pth")
+    np.save(f"./logs_{version}/history_loss_c.npy", history_loss_c)
+    np.save(f"./logs_{version}/history_loss_a.npy", history_loss_a)
+    np.save(f"./logs_{version}/history_entropy.npy", history_entropy)
+    np.save(f"./logs_{version}/history_confidence.npy", history_confidence)
+    evaluate_and_record(actor, device, n_steps)
     print("Modèle sauvegardé sous 'mon_modele_enduro.pth' !")
