@@ -4,7 +4,7 @@ version = "260416"
 # HYPERPARAMETRES
 #########################################################
 taille_buffer = int(1e5)
-n_steps = int(1e3)
+n_steps = int(1e5)
 n_envs = 32
 batch_size = 256
 
