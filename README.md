@@ -19,7 +19,7 @@ Le signal de guidage $\hat{a}$ est généré par un Softmax sur les Q-Values du 
 ## Choix d'Architecture et d'Hyperparamètres
 
 * **Héritage** : Nous conservons le facteur de discount `gamma = 0.99` et le `frame_skip = 4` des travaux originaux de DeepMind.
-* **Échelle de temps** : Pour ce run, nous avons opté pour une stabilité maximale en choisissant des taux d'apprentissage identiques pour les deux réseaux : `lr_actor = lr_critic = 1e-5`.
+* **Échelle de temps** : Pour le run , nous avons opté pour une stabilité maximale en choisissant des taux d'apprentissage identiques pour les deux réseaux : `lr_actor = lr_critic = 1e-5`.
 * **Horizon de décision** : Nous utilisons `n_layers = 1`, favorisant une boucle de contrôle réactive plutôt qu'une planification complexe en boucle ouverte.
 
 ## Évaluation et Efficacité Matérielle
