@@ -1,10 +1,10 @@
-version = "260416"
+version = "260417"
 
 #########################################################
 # HYPERPARAMETRES
 #########################################################
-taille_buffer = int(1e5)
-n_steps = int(1e5)
+taille_buffer = int(2e5)
+n_steps = int(1e6)
 n_envs = 32
 batch_size = 256
 
@@ -18,9 +18,7 @@ lr_critic = 1e-5  # 2.5e-4 de base masi je voulais le ralentir pour plus de stab
                   # des 2 reseaux.
 
 #hyperparametres supplementaires pour le Structured RL. Jai trouve ces valeurs en tatonant via le fichier .ipynb joint
-lr_actor = 1e-5
 temperature_actor = 0.1
-sigma_b = 2
 n_layers_actions = 1 # nb d'actions que l'actor anticipe a chaque etape (profondeur de l'arbre de decision de l'actor)
                      # (en pratique, il anticipe sur ce nombre d'etapes mais ne realise que la premiere action de son
                      # arbre de decision, puis a la prochaine etape il re-anticipe sur n_layers_actions et ainsi de suite)
@@ -29,8 +27,15 @@ n_layers_actions = 1 # nb d'actions que l'actor anticipe a chaque etape (profond
 nb_steps_critic_upgrade = 100 # tous les nb_steps_critic_upgrade pas, on copie les poids de Psi_beta dans Psi_beta_barre 
                               # suivant les notations de l'article, pour stabiliser l'apprentissage du critic
 m_samples = 32 # nombre de perturbations de theta que l'on echantillonne a chaque step
-entropy_factor = 0.2 # jai ajoute une entropie dans la loss de l'actor pour forcer l'exploration sinon je tombais
-                     # sistematiquement dans une politique qui choisissait toujours le meme chemin aveuglement
+
+sigma_b_init = 2
+sigma_b_final = 0.1
+entropy_factor_init = 0.2   # jai ajoute une entropie dans la loss de l'actor pour forcer l'exploration sinon je tombais
+entropy_factor_final = 0.02 # sistematiquement dans une politique qui choisissait toujours le meme chemin aveuglement
+lr_actor_init = 1e-5
+lr_actor_final = 1e-6
+
+
 
 # sert a pouvoir reduire le champs des actions a 4 actions pour avoir pas trop de combinaisons
 ACTION_MAP = {0: 1,  # Accelerate (Tout droit)
@@ -159,6 +164,22 @@ class GPUTensorBuffer:
         dones = self.dones[t_indices, env_indices].to(self.device)
         
         return states, actions, rewards, next_states, dones
+    
+    def save(self, path):
+        torch.save({
+            'frames': self.frames, 'actions': self.actions,
+            'rewards': self.rewards, 'dones': self.dones,
+            'ptr': self.ptr, 'size': self.size
+        }, path)
+
+    def load(self, path):
+        data = torch.load(path)
+        self.frames = data['frames']
+        self.actions = data['actions']
+        self.rewards = data['rewards']
+        self.dones = data['dones']
+        self.ptr = data['ptr']
+        self.size = data['size']
 
 # Fonction realisant un step de mise a jour pour l'Actor et le Critique en utilisant le batch d'expérience fourni
 # C'est la partie la plus importante du code, c'est ici que se trouvent:
@@ -168,7 +189,7 @@ def train_srl_step(
     actor, critic, critic_target,
     opt_actor, opt_critic,
     batch, device, 
-    gamma=gamma, sigma_b=sigma_b, temperature_actor=temperature_actor, entropy_factor=entropy_factor, m_samples=m_samples
+    gamma=gamma, sigma_b=sigma_b_init, temperature_actor=temperature_actor, entropy_factor=entropy_factor_init, m_samples=m_samples
 ):
     states, actions, rewards, next_states, dones = batch
     batch_size = states.shape[0]
@@ -314,13 +335,13 @@ if __name__ == '__main__':
     critic = NatureCNN(n_actions).to(device)         # Les poids Psi_beta du papier
     critic_target = copy.deepcopy(critic).to(device) # Les poids Pss_beta_barre du papier
     
-    opt_actor = optim.Adam(actor.parameters(), lr=lr_actor)
+    opt_actor = optim.Adam(actor.parameters(), lr=lr_actor_init)
     opt_critic = optim.Adam(critic.parameters(), lr=lr_critic)
 
     path_map = PATH_INDICES.to(device)
 
     print(f"Démarrage des {n_envs} environnements parallèles...")
-    envs = gym.vector.AsyncVectorEnv([make_env() for _ in range(n_envs)])
+    envs = gym.vector.SyncVectorEnv([make_env() for _ in range(n_envs)])
     replay_buffer = GPUTensorBuffer(capacity=taille_buffer, n_envs=n_envs, device=device)
     obs, infos = envs.reset()
     history_loss_c = np.zeros(n_steps) # pour le .ipynb
@@ -371,6 +392,17 @@ if __name__ == '__main__':
     next_save_step = 400
 
     for step in tqdm(range(n_steps)):
+
+        # scheduling
+        fraction = min(1.0, step / n_steps/0.8)
+
+        current_sigma_b = sigma_b_init + fraction * (sigma_b_final - sigma_b_init)
+        current_entropy_factor = entropy_factor_init + fraction * (entropy_factor_final - entropy_factor_init)
+        current_lr_actor = lr_actor_init + fraction * (lr_actor_final - lr_actor_init)
+
+        for param_group in opt_actor.param_groups:
+            param_group['lr'] = current_lr_actor
+
         with torch.no_grad():
             theta = actor(current_stack)
             path_scores = theta[:, path_map].sum(dim=-1) # [n_envs, 256]
@@ -401,7 +433,9 @@ if __name__ == '__main__':
                 critic_target,
                 opt_actor, opt_critic,
                 batch, device,
-                sigma_b=sigma_b
+                sigma_b=current_sigma_b,
+                entropy_factor=current_entropy_factor
+
             )
             
             history_loss_c[step] = loss_c
@@ -433,11 +467,13 @@ if __name__ == '__main__':
 
     envs.close()
     print("\nEntraînement terminé ! Sauvegarde du cerveau de l'IA en cours...")
-    torch.save(actor.state_dict(), f"./poids_{version}/actor_{n_steps}.pth")
-    torch.save(critic.state_dict(), f"./poids_{version}/critic_{n_steps}.pth")
-    np.save(f"./logs_{version}/history_loss_c.npy", history_loss_c)
-    np.save(f"./logs_{version}/history_loss_a.npy", history_loss_a)
-    np.save(f"./logs_{version}/history_entropy.npy", history_entropy)
-    np.save(f"./logs_{version}/history_confidence.npy", history_confidence)
-    evaluate_and_record(actor, device, n_steps)
-    print("Modèle sauvegardé sous 'mon_modele_enduro.pth' !")
+    torch.save(actor.state_dict(), f"./poids_{version}/actor_final_1M.pth")
+    torch.save(critic.state_dict(), f"./poids_{version}/critic_final_1M.pth")
+    
+    # Sauvegarde des métriques pour analyse dans .ipynb
+    np.save(f"./metrics_{version}/loss_c.npy", history_loss_c)
+    np.save(f"./metrics_{version}/loss_a.npy", history_loss_a)
+    np.save(f"./metrics_{version}/entropy.npy", history_entropy)
+    np.save(f"./metrics_{version}/confidence.npy", history_confidence)
+    
+    evaluate_and_record(actor, device, "final")
