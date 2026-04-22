@@ -19,12 +19,20 @@ Le signal de guidage $\hat{a}$ est généré par un Softmax sur les Q-Values du 
 ## Choix d'Architecture et d'Hyperparamètres
 
 * **Héritage** : Nous conservons le facteur de discount `gamma = 0.99` et le `frame_skip = 4` des travaux originaux de DeepMind.
-* **Échelle de temps** : Pour le run , nous avons opté pour une stabilité maximale en choisissant des taux d'apprentissage identiques pour les deux réseaux : `lr_actor = lr_critic = 1e-5`.
+* **Échelle de temps** : Pour les premiers tests et l'entraînement intermédiaire, nous avons opté pour une stabilité maximale avec des taux d'apprentissage identiques et fixes (`lr_actor = lr_critic = 1e-5`), avant d'introduire un *scheduling* dynamique pour l'Acteur dans le run final.
 * **Horizon de décision** : Nous utilisons `n_layers = 1`, favorisant une boucle de contrôle réactive plutôt qu'une planification complexe en boucle ouverte.
 
-## Évaluation et Efficacité Matérielle
+## Résultats et Entraînement
 
-L'ensemble de la recherche d'hyperparamètres a été effectuée sur un Mac Mini M4, permettant d'obtenir des résultats satisfaisants en seulement **15 minutes**. Le run final, nécessaire pour obtenir une IA fine et performante sur 100 000 étapes, dure un peu moins de **2h30**.
+L'évolution de l'agent a été documentée à travers différentes phases d'expérimentation :
+
+* **Phase de test initiale (~15 min) :** L'ajustement des premiers hyperparamètres a permis d'observer des comportements d'évitement dès le début de l'apprentissage.
+* **Entraînement intermédiaire ([train_100k_steps.py](./train_100k_steps.py)) :** Ce run de 100 000 étapes (environ 2h30) permet d'atteindre un niveau proche de celui d'un humain moyen. L'agent est performant sur sol vert, bien qu'il éprouve des difficultés lors des inversions de couleurs (nuit/neige).
+    * *Voir la [vidéo à 10^5 étapes](./Video_1e5.mp4) pour observer ce comportement.*
+* **Entraînement complet ([train_1M_steps.py](./train_1M_steps.py)) :** Un run de 1 000 000 d'étapes (environ 27h) a été effectué. Pour cette phase, une planification (*scheduling*) des paramètres `sigma_b`, `entropy_factor` et `lr_actor` a été mise en place pour affiner la politique en fin d'apprentissage.
+    * **Performances :** L'agent reconnaît désormais les différents terrains et atteint des scores d'environ **750 voitures doublées**, dépassant les 470 rapportés par le modèle DQN dans l'article de [DeepMind (2013)](./references/1312.5602.pdf).
+    * **Note :** Le training a été stoppé à 27h car ce délai suffisait à valider le fonctionnement de l'algorithme, bien que des scores plus élevés soient probablement atteignables en prolongeant le calcul.
+    * *Voir la [vidéo à 10^6 étapes](./Video_1e6.mp4) pour le résultat final.*
 
 ## Organisation du Dépôt
 
