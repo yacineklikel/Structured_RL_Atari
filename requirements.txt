@@ -1,5 +1,5 @@
 # =============================================================================
-# DEPENDANCES POUR LE PROJET RL ENDURO (Mac Apple Silicon / Python 3.12)
+# DEPENDENCIES FOR THE ENDURO RL PROJECT (Apple Silicon Mac / Python 3.12)
 # =============================================================================
 
 # --- Core Deep Learning Framework ---

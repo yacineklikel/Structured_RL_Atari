@@ -1,39 +1,39 @@
-version = "260421"
+run_name = "100k"  # tag used for the output folders (weights_100k/, videos_100k/, metrics_100k/)
 
 #########################################################
-# HYPERPARAMETRES
+# HYPERPARAMETERS
 #########################################################
-taille_buffer = int(1e5)
+buffer_size = int(1e5)
 n_steps = int(1e5)
 n_envs = 32
 batch_size = 256
 
-#hyperparametres de Deep_Mind 2013 (je ne les ai pas touché pour l'instant)
+# Hyperparameters from DeepMind 2013 (left unchanged)
 gamma = 0.99
 n_skip = 4
 
-#parmis les hyper-parametres de DeepMind 2013, jai seulement modifie
-lr_critic = 1e-5  # 2.5e-4 de base masi je voulais le ralentir pour plus de stabilite,
-                  # car les courbes de loss etaient tres bruitees sinon pour chaucn 
-                  # des 2 reseaux.
+# The only DeepMind 2013 hyperparameter I changed:
+lr_critic = 1e-5  # 2.5e-4 originally, lowered for stability: otherwise the loss
+                  # curves of both networks were very noisy.
 
-#hyperparametres supplementaires pour le Structured RL. Jai trouve ces valeurs en tatonant via le fichier .ipynb joint
+# Additional Structured RL hyperparameters, tuned by trial and error
+# by looking at the loss / entropy / confidence curves.
 lr_actor = 1e-5
 temperature_actor = 0.1
 sigma_b = 2
-n_layers_actions = 1 # nb d'actions que l'actor anticipe a chaque etape (profondeur de l'arbre de decision de l'actor)
-                     # (en pratique, il anticipe sur ce nombre d'etapes mais ne realise que la premiere action de son
-                     # arbre de decision, puis a la prochaine etape il re-anticipe sur n_layers_actions et ainsi de suite)
-                     # en pratique je lai mis a 1 pour converger plus vite mais il est probable quon puisse laugmenter et 
-                     # bourinner le n_step pour trouver des comportements encore plus fins.
-nb_steps_critic_upgrade = 100 # tous les nb_steps_critic_upgrade pas, on copie les poids de Psi_beta dans Psi_beta_barre 
-                              # suivant les notations de l'article, pour stabiliser l'apprentissage du critic
-m_samples = 32 # nombre de perturbations de theta que l'on echantillonne a chaque step
-entropy_factor = 0.2 # jai ajoute une entropie dans la loss de l'actor pour forcer l'exploration sinon je tombais
-                     # sistematiquement dans une politique qui choisissait toujours le meme chemin aveuglement
+n_layers_actions = 1  # number of actions the actor plans ahead at each step (depth of its decision tree).
+                      # The actor plans over this horizon but only executes the first action of the
+                      # best path, then re-plans at the next step (receding horizon).
+                      # Set to 1 for faster convergence; a deeper tree combined with more training
+                      # steps could probably produce finer behaviours.
+nb_steps_critic_upgrade = 100  # every nb_steps_critic_upgrade steps, the weights psi_beta are copied into
+                               # psi_beta_bar (paper notation) to stabilise critic training
+m_samples = 32  # number of perturbations of theta sampled at each step
+entropy_factor = 0.2  # entropy bonus added to the actor loss to force exploration; without it the policy
+                      # systematically collapsed onto always choosing the same path
 
-# sert a pouvoir reduire le champs des actions a 4 actions pour avoir pas trop de combinaisons
-ACTION_MAP = {0: 1,  # Accelerate (Tout droit)
+# Restricts the action space to 4 actions to keep the number of combinations small
+ACTION_MAP = {0: 1,  # Accelerate (straight)
               1: 7,  # Accelerate Right
               2: 8,  # Accelerate Left
               3: 0,  # Slowdown
@@ -41,18 +41,19 @@ ACTION_MAP = {0: 1,  # Accelerate (Tout droit)
 n_actions = len(ACTION_MAP)
 n_nodes = 0
 for k in range(n_layers_actions):
-   n_nodes += n_actions ** (k + 1) # 4 + 16 + 64 + 256 = 340 
-                                      # = taille sortie reseau
-                                      # = nb de noeuds dans l'arbre de decision de l'actor
-n_paths = n_actions ** n_layers_actions # 4^4 = 256
+    n_nodes += n_actions ** (k + 1)  # n_actions + n_actions^2 + ... (e.g. 4 + 16 + 64 + 256 = 340 for a depth of 4)
+                                     # = actor output size
+                                     # = number of nodes in the actor's decision tree
+n_paths = n_actions ** n_layers_actions  # number of leaves / paths (e.g. 4^4 = 256 for a depth of 4)
 
 
 
 import numpy as np
-from tqdm import tqdm 
-import random
+from tqdm import tqdm
 import os
 import copy
+import gc
+import glob
 
 import torch
 import torch.nn as nn
@@ -65,15 +66,14 @@ from gymnasium.wrappers import AtariPreprocessing
 from gymnasium.wrappers import FrameStackObservation
 import ale_py
 gym.register_envs(ale_py)
-import glob
 
 
 # =========================================================================
-# Un chemin antiticpe sur n_layers_actions peut etre percu comme une trajectoire de
-#  longueur n_layers_actions ou comme 4 noeuds successifs dans un arbre de decision
-# On construit ici une matrice de correspondance qui nous permettra de faire le lien entre :
-#  - les 256 chemins possibles
-#  - les 340 noeuds de l'arbre de decision de l'actor
+# A path planned over n_layers_actions steps can be seen either as a trajectory
+# of n_layers_actions actions, or as n_layers_actions successive nodes in a decision tree.
+# Here we build a lookup table linking:
+#  - the n_paths possible paths
+#  - the n_nodes nodes of the actor's decision tree
 # =========================================================================
 paths = []
 first_leaf = sum(n_actions**k for k in range(1, n_layers_actions))
@@ -81,14 +81,14 @@ num_leaves = n_actions ** n_layers_actions
 for leaf in range(first_leaf, first_leaf + num_leaves):
     path = [leaf]
     current = leaf
-    for _ in range(n_layers_actions - 1): 
+    for _ in range(n_layers_actions - 1):
         current = (current - n_actions) // n_actions
         path.append(current)
-    paths.append(path[::-1]) 
+    paths.append(path[::-1])
 PATH_INDICES = torch.tensor(paths, dtype=torch.long)
 
-# Jai repris le reseau classique propose en 2015, encore par DeepMind, pour resoudre des jeux Attari
-# (on utilise aussi ce rsseau pour l'actor meme si eux n'avaieent qu'un critic)
+# NatureCNN-style network, inspired by DeepMind's 2015 Atari agent (Mnih et al., Nature 2015).
+# It is also used for the actor here, even though DQN only had a critic.
 class NatureCNN(nn.Module):
     def __init__(self, output_dim):
         super().__init__()
@@ -104,18 +104,19 @@ class NatureCNN(nn.Module):
         )
     def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.size(0), -1) # Aplatit l'image
+        x = x.view(x.size(0), -1)  # flatten the feature maps
         return self.fc(x)
 
-# Buffer bien optimisepour stocker les transitions directement sur le CPU, et y echantiollonner des batches
-class GPUTensorBuffer:
+# Memory-efficient replay buffer: stores single uint8 frames on the CPU (instead of full
+# 4-frame stacks) and rebuilds the stacked states on the target device at sampling time.
+class ReplayBuffer:
     def __init__(self, capacity, n_envs, device):
         self.n_envs = n_envs
         self.max_steps = capacity // n_envs
         self.ptr = 0
         self.size = 0
         self.device = device
-        
+
         self.frames = torch.zeros((self.max_steps, n_envs, 84, 84), dtype=torch.uint8)
         self.actions = torch.zeros((self.max_steps, n_envs), dtype=torch.int64)
         self.rewards = torch.zeros((self.max_steps, n_envs), dtype=torch.float32)
@@ -133,18 +134,18 @@ class GPUTensorBuffer:
         self.actions[self.ptr] = torch.tensor(actions, dtype=torch.int64)
         self.rewards[self.ptr] = torch.from_numpy(rewards).to(dtype=torch.float32)
         self.dones[self.ptr] = torch.from_numpy(dones).to(dtype=torch.float32)
-        
+
         self.ptr = (self.ptr + 1) % self.max_steps
         self.size = min(self.size + 1, self.max_steps)
-        
+
     def sample(self, batch_size):
         t_indices = torch.randint(3, self.size - 1, (batch_size,))
         env_indices = torch.randint(0, self.n_envs, (batch_size,))
-        
+
         if self.size == self.max_steps:
             distance_to_ptr = (self.ptr - t_indices) % self.max_steps
-            t_indices[distance_to_ptr <= 4] -= 5 
-            
+            t_indices[distance_to_ptr <= 4] -= 5
+
         s0 = self.frames[t_indices - 3, env_indices]
         s1 = self.frames[t_indices - 2, env_indices]
         s2 = self.frames[t_indices - 1, env_indices]
@@ -153,77 +154,77 @@ class GPUTensorBuffer:
 
         states = torch.stack([s0, s1, s2, s3], dim=1).to(torch.float32).to(self.device) / 255.0
         next_states = torch.stack([s1, s2, s3, ns3], dim=1).to(torch.float32).to(self.device) / 255.0
-        
+
         actions = self.actions[t_indices, env_indices].to(self.device)
         rewards = self.rewards[t_indices, env_indices].to(self.device)
         dones = self.dones[t_indices, env_indices].to(self.device)
-        
+
         return states, actions, rewards, next_states, dones
 
-# Fonction realisant un step de mise a jour pour l'Actor et le Critique en utilisant le batch d'expérience fourni
-# C'est la partie la plus importante du code, c'est ici que se trouvent:
-#  - la mise a jour du Critique classique (MSE entre Q et y_j)
-#  - la mise a jour de l'Actor avec la loss de Fenchel-Young + entropie que j'ai ajoute pour forcer l'exploration
+# One update step for both the actor and the critic on the given batch of experience.
+# This is the core of the algorithm:
+#  - standard critic update (MSE between Q and the target y_j)
+#  - actor update with the Fenchel-Young loss, plus an entropy bonus to force exploration
 def train_srl_step(
     actor, critic, critic_target,
     opt_actor, opt_critic,
-    batch, device, 
+    batch, path_map, device,
     gamma=gamma, sigma_b=sigma_b, temperature_actor=temperature_actor, entropy_factor=entropy_factor, m_samples=m_samples
 ):
     states, actions, rewards, next_states, dones = batch
     batch_size = states.shape[0]
 
     # =========================================================================
-    # PHASE 1 : Mise à jour du Critique
+    # PHASE 1: Critic update
     # =========================================================================
     with torch.no_grad():
         next_q = critic_target(next_states)
         max_next_q, _ = torch.max(next_q, dim=1)
-        target_q = rewards + gamma * (1 - dones) * max_next_q #y_j dans le papier, la cible pour le critic
+        target_q = rewards + gamma * (1 - dones) * max_next_q  # y_j in the paper: the critic's target
 
-    critic_all_outputs = critic(states)    
+    critic_all_outputs = critic(states)
     current_q = critic_all_outputs.gather(1, actions.unsqueeze(1)).squeeze(1)
     loss_critic = F.mse_loss(current_q, target_q)
-    
+
     opt_critic.zero_grad()
     loss_critic.backward()
     opt_critic.step()
 
     # =========================================================================
-    # PHASE 2 : Mise à jour de l'Acteur (Loss de Fenchel-Young / Structured RL)
+    # PHASE 2: Actor update (Fenchel-Young loss / Structured RL)
     # =========================================================================
     theta = actor(states)
-    
+
     noise = torch.randn(batch_size, m_samples, n_nodes, device=device) * sigma_b
-    perturbed_theta = theta.unsqueeze(1) + noise 
-    path_scores = perturbed_theta[:, :, path_map].sum(dim=-1) # [batch_size, m_samples, 256]
-    best_path_ids = torch.argmax(path_scores, dim=-1) # [batch_size, m_samples]
-    first_actions = path_map[best_path_ids, 0] 
+    perturbed_theta = theta.unsqueeze(1) + noise
+    path_scores = perturbed_theta[:, :, path_map].sum(dim=-1)  # [batch_size, m_samples, n_paths]
+    best_path_ids = torch.argmax(path_scores, dim=-1)  # [batch_size, m_samples]
+    first_actions = path_map[best_path_ids, 0]
     with torch.no_grad():
         q_expand = critic_all_outputs.detach().unsqueeze(1).expand(-1, m_samples, -1)
         q_candidates = torch.gather(q_expand, 2, first_actions.unsqueeze(-1)).squeeze(-1)
         q_max, _ = torch.max(q_candidates, dim=1, keepdim=True)
-        target_probs = F.softmax((q_candidates - q_max) / temperature_actor, dim=1) 
+        target_probs = F.softmax((q_candidates - q_max) / temperature_actor, dim=1)
 
-    # Calcul de la loss de l'Actor selon la formule de Fenchel-Young en 2 termes :
-    # TERME 1 : Espérance du max perturbé : E[ max_a (theta_bruite.T @ a) ]
-    max_path_scores = torch.max(path_scores, dim=-1)[0] # Shape: [batch_size, m_samples]
-    premier_terme = torch.mean(max_path_scores, dim=1).mean() 
-    # TERME 2 : - theta.T @ a_critic
-    unperturbed_path_scores = theta[:, path_map].sum(dim=-1) # [batch_size, 256]
-    scores_for_sampled_paths = torch.gather(unperturbed_path_scores, 1, best_path_ids) 
-    deuxieme_terme = -torch.sum(target_probs * scores_for_sampled_paths, dim=1).mean()
+    # Actor loss, following the Fenchel-Young formula in two terms:
+    # TERM 1: expectation of the perturbed max: E[ max_a (theta_perturbed^T a) ]
+    max_path_scores = torch.max(path_scores, dim=-1)[0]  # [batch_size, m_samples]
+    first_term = torch.mean(max_path_scores, dim=1).mean()
+    # TERM 2: - theta^T a_critic
+    unperturbed_path_scores = theta[:, path_map].sum(dim=-1)  # [batch_size, n_paths]
+    scores_for_sampled_paths = torch.gather(unperturbed_path_scores, 1, best_path_ids)
+    second_term = -torch.sum(target_probs * scores_for_sampled_paths, dim=1).mean()
 
-    # Calcul de l'entropie de la distribution de probabilités sur les chemins pour forcer l'exploration
+    # Entropy of the probability distribution over paths, to force exploration
     log_path_probs = F.log_softmax(unperturbed_path_scores, dim=-1)
     path_probs = torch.exp(log_path_probs)
     entropy_tensor = -torch.sum(path_probs * log_path_probs, dim=-1).mean()
 
-    # LA LOSS FINALE
-    loss_actor = premier_terme + deuxieme_terme - (entropy_factor * entropy_tensor)
+    # FINAL LOSS
+    loss_actor = first_term + second_term - (entropy_factor * entropy_tensor)
     # -------------------------------------------------------------------------
 
-    # Capteurs Passifs pour les graphiques 
+    # Passive monitoring metrics for the plots (no gradient)
     with torch.no_grad():
         critic_probs = F.softmax(critic_all_outputs / temperature_actor, dim=1)
         max_confidence = torch.max(critic_probs, dim=1)[0].mean().item()
@@ -235,11 +236,11 @@ def train_srl_step(
     loss_actor.backward()
     torch.nn.utils.clip_grad_norm_(actor.parameters(), 2.0)
     opt_actor.step()
-    
+
     return loss_critic.item(), loss_actor.item(), entropy, max_confidence
 
-# Fonction moche qui permet de lancer l'emulateur Atari sans l'ecrire dans mon terminal
-# (juste pour avoir un joli terminal avec seulement les tqdm dedans)
+# Creates an Atari environment while silencing the emulator's console output
+# (keeps the terminal clean, with only the tqdm progress bars)
 def make_env():
     def _init():
         old_stdout = os.dup(1)
@@ -259,126 +260,121 @@ def make_env():
         return env
     return _init
 
-# Aucune utilite dans le training, c'est juste pour filmer le joueur etvoir comment il se debrouille
-def evaluate_and_record(actor, device, step_num, video_folder=f"./videos_{version}"):
+# Not used for training: plays one greedy episode and records it as a video
+# to check how the agent behaves
+def evaluate_and_record(actor, path_map, device, step_num, video_folder=f"./videos_{run_name}"):
     eval_env = gym.make("ALE/Enduro-v5", render_mode="rgb_array", frameskip=1)
     eval_env = AtariPreprocessing(eval_env, screen_size=84, grayscale_obs=True, frame_skip=n_skip)
     eval_env = FrameStackObservation(eval_env, stack_size=n_skip)
-    
+
     eval_env = RecordVideo(eval_env, video_folder, episode_trigger=lambda x: True, name_prefix=f"step_{step_num}")
     obs, _ = eval_env.reset()
     done = False
-    
+
     while not done:
-        obs_array = np.array(obs.__array__()) 
+        obs_array = np.array(obs.__array__())
         obs_tensor = torch.tensor(obs_array, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
         with torch.no_grad():
             theta = actor(obs_tensor)
             path_scores = theta[:, path_map].sum(dim=-1)
             best_path_ids = torch.argmax(path_scores, dim=1)
             action_nn = path_map[best_path_ids, 0].item()
-            action_env = ACTION_MAP[action_nn] 
+            action_env = ACTION_MAP[action_nn]
         obs, _ , terminated, truncated, _ = eval_env.step(action_env)
         done = terminated or truncated
-        
+
     eval_env.close()
 
     # =========================================================================
-    # LE NETTOYAGE : cette partie sert a rien juste a renommer les ficheirs pour
-    # faire un joli dossier
+    # CLEANUP: rename the recorded files to keep the video folder tidy
     # =========================================================================
-    for fichier in glob.glob(os.path.join(video_folder, f"step_{step_num}*episode*")):
-        # Si c'est la vidéo, on la renomme proprement
-        if fichier.endswith(".mp4"):
-            nom_propre = os.path.join(video_folder, f"step_{step_num}.mp4")
-            # Sécurité : si la vidéo propre existe déjà, on l'écrase
-            if os.path.exists(nom_propre):
-                os.remove(nom_propre)
-            os.rename(fichier, nom_propre)
-        # Si c'est le fichier meta, on le jette à la poubelle
-        elif fichier.endswith(".meta.json"):
-            os.remove(fichier)
+    for file_path in glob.glob(os.path.join(video_folder, f"step_{step_num}*episode*")):
+        # Rename the video to a clean name
+        if file_path.endswith(".mp4"):
+            clean_name = os.path.join(video_folder, f"step_{step_num}.mp4")
+            # Overwrite the video if the clean name already exists
+            if os.path.exists(clean_name):
+                os.remove(clean_name)
+            os.rename(file_path, clean_name)
+        # Discard the metadata file
+        elif file_path.endswith(".meta.json"):
+            os.remove(file_path)
     # =========================================================================
 
 
 
 if __name__ == '__main__':
-    os.makedirs(f"./poids_{version}", exist_ok=True)
-    os.makedirs(f"./videos_{version}", exist_ok=True)
-    os.makedirs(f"./logs_{version}", exist_ok=True)
+    os.makedirs(f"./weights_{run_name}", exist_ok=True)
+    os.makedirs(f"./videos_{run_name}", exist_ok=True)
+    os.makedirs(f"./metrics_{run_name}", exist_ok=True)
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Utilisation de l'appareil : {device}")
+    print(f"Using device: {device}")
 
     actor = NatureCNN(n_nodes).to(device)
-    critic = NatureCNN(n_actions).to(device)         # Les poids Psi_beta du papier
-    critic_target = copy.deepcopy(critic).to(device) # Les poids Pss_beta_barre du papier
-    
+    critic = NatureCNN(n_actions).to(device)          # weights psi_beta in the paper
+    critic_target = copy.deepcopy(critic).to(device)  # weights psi_beta_bar in the paper
+
     opt_actor = optim.Adam(actor.parameters(), lr=lr_actor)
     opt_critic = optim.Adam(critic.parameters(), lr=lr_critic)
 
     path_map = PATH_INDICES.to(device)
 
-    print(f"Démarrage des {n_envs} environnements parallèles...")
+    print(f"Starting {n_envs} parallel environments...")
     envs = gym.vector.SyncVectorEnv([make_env() for _ in range(n_envs)])
-    replay_buffer = GPUTensorBuffer(capacity=taille_buffer, n_envs=n_envs, device=device)
-    obs, infos = envs.reset()
-    history_loss_c = np.zeros(n_steps) # pour le .ipynb
+    replay_buffer = ReplayBuffer(capacity=buffer_size, n_envs=n_envs, device=device)
+    history_loss_c = np.zeros(n_steps)  # metrics saved for offline analysis
     history_loss_a = np.zeros(n_steps)
     history_entropy = np.zeros(n_steps)
     history_confidence = np.zeros(n_steps)
 
-    print("Début de l'entraînement !")
     # =========================================================================
-    # PHASE DE WARM-UP : Remplissage du buffer avec des actions aléatoires
+    # WARM-UP: pre-fill the replay buffer before training.
+    # Only the "Accelerate" action is played, so that the buffer contains more
+    # useful transitions than with fully random actions.
     # =========================================================================
-    current_stack = torch.zeros((n_envs, n_skip, 84, 84), dtype=torch.uint8, device=device)
     obs, infos = envs.reset()
     obs_gpu = torch.tensor(obs, dtype=torch.float32, device=device) / 255.0
-    current_stack = obs_gpu.unsqueeze(1).repeat(1, 4, 1, 1) 
-    warmup_ratio = 1.0 # pour preremplir 100% du buffer
-    warmup_steps = int((taille_buffer // n_envs) * warmup_ratio)
-    print(f"\nPhase d'échauffement : Pré-remplissage ({warmup_steps * n_envs} transitions)...")
-    # Tableaux pour suivre l'état (l'action et le verrou) de chaque environnement (32 au total)
-    current_actions = [0] * n_envs
-    action_locks = [0] * n_envs
+    current_stack = obs_gpu.unsqueeze(1).repeat(1, 4, 1, 1)
+    warmup_ratio = 1.0  # fraction of the buffer to pre-fill
+    warmup_steps = int((buffer_size // n_envs) * warmup_ratio)
+    print(f"\nWarm-up: pre-filling the buffer ({warmup_steps * n_envs} transitions)...")
+    warmup_action = 0  # index of "Accelerate" in ACTION_MAP
 
     for _ in tqdm(range(warmup_steps)):
-        # Choix d'actions purement aléatoires pendant l'échauffement
-        action_nn = [random.randint(0, n_actions - 1) for _ in range(n_envs)]
+        action_nn = [warmup_action] * n_envs  # the stored action matches the action actually played
         action_env = [ACTION_MAP[a] for a in action_nn]
-        action_env = [1 for _ in range(n_envs)] #juste pour le warmup, on met que l'action "accelerate" pour que le buffer soit rempli de transitions un peu plus interessantes que si on mettait des actions completement aleatoires
 
         next_obs, rewards, terminateds, truncateds, infos = envs.step(action_env)
         dones = np.logical_or(terminateds, truncateds)
 
         next_obs_gpu_uint8 = torch.from_numpy(next_obs).to(dtype=torch.uint8, device=device)
         replay_buffer.push(next_obs_gpu_uint8, action_nn, rewards, dones)
-        
+
         current_stack = current_stack.roll(shifts=-1, dims=1)
         next_obs_float = next_obs_gpu_uint8.to(dtype=torch.float32, device=device) / 255.0
         current_stack[:, -1, :, :] = next_obs_float
-        
+
         dones_tensor = torch.from_numpy(dones).to(dtype=torch.bool, device=device)
         if dones_tensor.any():
             current_stack[dones_tensor] = next_obs_float[dones_tensor].unsqueeze(1).repeat(1, 4, 1, 1)
 
 
-    print("Échauffement terminé. Le Buffer est amorcé avec succès !")
+    print("Warm-up done: the replay buffer is filled.")
     # =========================================================================
 
-    print("\nDébut de l'entraînement !")
+    print("\nStarting training!")
     next_save_step = 400
 
     for step in tqdm(range(n_steps)):
         with torch.no_grad():
             theta = actor(current_stack)
-            path_scores = theta[:, path_map].sum(dim=-1) # [n_envs, 256]
-            action_probs = F.softmax(path_scores, dim=1) 
+            path_scores = theta[:, path_map].sum(dim=-1)  # [n_envs, n_paths]
+            action_probs = F.softmax(path_scores, dim=1)
             best_path_ids = torch.multinomial(action_probs, num_samples=1).squeeze(1)
-            
+
             action_nn = path_map[best_path_ids, 0].cpu().numpy().tolist()
-            
+
         action_env = [ACTION_MAP[a] for a in action_nn]
         next_obs, rewards, terminateds, truncateds, infos = envs.step(action_env)
         dones = np.logical_or(terminateds, truncateds)
@@ -391,53 +387,55 @@ if __name__ == '__main__':
         dones_tensor = torch.from_numpy(dones).to(dtype=torch.bool, device=device)
         if dones_tensor.any():
             current_stack[dones_tensor] = next_obs_float[dones_tensor].unsqueeze(1).repeat(1, 4, 1, 1)
-        
-        obs = next_obs
+
         if len(replay_buffer) > batch_size:
             batch = replay_buffer.sample(batch_size)
-            
+
             loss_c, loss_a, entropy, max_confidence = train_srl_step(
-                actor, critic, 
+                actor, critic,
                 critic_target,
                 opt_actor, opt_critic,
-                batch, device,
+                batch, path_map, device,
                 sigma_b=sigma_b
             )
-            
+
             history_loss_c[step] = loss_c
             history_loss_a[step] = loss_a
             history_entropy[step] = entropy
             history_confidence[step] = max_confidence
 
             if step % nb_steps_critic_upgrade == 0:
-                critic_target.load_state_dict(critic.state_dict())                
-        # 6. FILMER LA PROGRESSION
+                critic_target.load_state_dict(critic.state_dict())
+        # Record a video and save checkpoints (at step 1, then 400, 800, 1600, ...)
         if step == 0 or (step + 1) >= next_save_step:
-            print(f"\nEnregistrement de la vidéo à l'étape {step + 1}...")
-            evaluate_and_record(actor, device, step + 1)
-            torch.save(actor.state_dict(), f"./poids_{version}/actor_{step + 1}.pth")
-            torch.save(critic.state_dict(), f"./poids_{version}/critic_{step + 1}.pth")
+            print(f"\nRecording video at step {step + 1}...")
+            evaluate_and_record(actor, path_map, device, step + 1)
+            torch.save(actor.state_dict(), f"./weights_{run_name}/actor_{step + 1}.pth")
+            torch.save(critic.state_dict(), f"./weights_{run_name}/critic_{step + 1}.pth")
             if step > 0:
                 next_save_step *= 2
-                
+
         del next_obs_gpu_uint8
         del next_obs_float
         if 'batch' in locals():
             del batch
-        
+
+        # Periodically free memory (MPS cache)
         if step % 100 == 0:
-            import gc
-            gc.collect() 
+            gc.collect()
             if torch.backends.mps.is_available():
                 torch.mps.empty_cache()
 
     envs.close()
-    print("\nEntraînement terminé ! Sauvegarde du cerveau de l'IA en cours...")
-    torch.save(actor.state_dict(), f"./poids_{version}/actor_{n_steps}.pth")
-    torch.save(critic.state_dict(), f"./poids_{version}/critic_{n_steps}.pth")
-    np.save(f"./logs_{version}/history_loss_c.npy", history_loss_c)
-    np.save(f"./logs_{version}/history_loss_a.npy", history_loss_a)
-    np.save(f"./logs_{version}/history_entropy.npy", history_entropy)
-    np.save(f"./logs_{version}/history_confidence.npy", history_confidence)
-    evaluate_and_record(actor, device, n_steps)
-    print("Modèle sauvegardé sous 'mon_modele_enduro.pth' !")
+    print("\nTraining finished! Saving the model...")
+    torch.save(actor.state_dict(), f"./weights_{run_name}/actor_{n_steps}.pth")
+    torch.save(critic.state_dict(), f"./weights_{run_name}/critic_{n_steps}.pth")
+
+    # Save the metrics for offline analysis
+    np.save(f"./metrics_{run_name}/loss_c.npy", history_loss_c)
+    np.save(f"./metrics_{run_name}/loss_a.npy", history_loss_a)
+    np.save(f"./metrics_{run_name}/entropy.npy", history_entropy)
+    np.save(f"./metrics_{run_name}/confidence.npy", history_confidence)
+
+    evaluate_and_record(actor, path_map, device, n_steps)
+    print(f"Model saved in ./weights_{run_name}/")
